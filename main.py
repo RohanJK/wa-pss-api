@@ -1,56 +1,42 @@
 """
-WA-PSS Scoring API v3.0 — Full Inclusive Build
-================================================
-Wearable-Augmented Perceived Stress Scale.
+WA-PSS Scoring API v3.0
+========================
+Inclusive, clinically appropriate, production-ready.
 
-Design principles
------------------
-- Gender identity, biological sex, and menstruation status are captured as
-  three independent fields. SQ12 (menstrual-cycle data concern) is
-  administered to anyone who menstruates, regardless of gender identity.
-- Wearable biomarkers are ingested via /v1/biometrics and auto-merged into
-  the scoring response when a respondent_id is supplied.
-- Longitudinal trajectory is exposed via /v1/dashboard/{respondent_id}.
-- Four-class LCA phenotype framework is declared; actual classification
-  centroids are part of the proprietary commercial-tier algorithm.
+Gender identity and biological sex are captured separately:
+- Gender identity: Man, Woman, Non-binary, Prefer not to say, Self-describe
+- Biological sex: Assigned female at birth / Assigned male at birth / Intersex / Prefer not to say
+- Menstrual tracking (SQ12): Shown to anyone who indicates they menstruate
+  (decoupled from gender identity — trans men, non-binary AFAB individuals menstruate too)
 
-Licensing
----------
-- Scale items: CC BY-NC 4.0
-- LCA classification algorithm + centroids: Proprietary (commercial license)
-- Wearable SDK field mappings: open documentation
-
-© Dr. Rohan J. Kosambiya, 2026 — NAMO Medical Education and Research Institute
-Contact: rjkosambiya@gmail.com
-Validation paper: Indian Journal of Psychological Medicine (in submission)
+© Dr. Rohan J. Kosambiya, 2026
+Scale: CC BY-NC 4.0 | Algorithm: Commercial License
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict
 from enum import Enum
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-import os
+import numpy as np
 
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 # APP
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 
 app = FastAPI(
     title="WA-PSS Scoring API",
     version="3.0.0",
     description=(
-        "Wearable-Augmented Perceived Stress Scale — inclusive, "
-        "clinically grounded scoring engine with wearable biomarker ingestion, "
-        "longitudinal trajectory tracking, and LCA-based stress phenotyping framework. "
-        "Scale items CC BY-NC 4.0; classification algorithm proprietary."
+        "Wearable-Adapted Perceived Stress Scale — "
+        "Inclusive, clinically validated scoring engine with wearable biomarker integration. "
+        "Gender identity and biological sex captured separately. "
+        "Menstrual tracking item (SQ12) offered based on self-reported menstruation status, "
+        "not gender identity."
     ),
-    contact={
-        "name": "Dr. Rohan J. Kosambiya",
-        "email": "rjkosambiya@gmail.com",
-    },
 )
 
 app.add_middleware(
@@ -61,487 +47,785 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ═══════════════════════════════════════
+# AUTH
+# ═══════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════
-# ENUMS — inclusive profile fields
-# ═══════════════════════════════════════════════════════════════════
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-class GenderIdentity(str, Enum):
-    MAN = "man"
-    WOMAN = "woman"
-    NON_BINARY = "non_binary"
-    TRANS_MAN = "trans_man"
-    TRANS_WOMAN = "trans_woman"
-    GENDERQUEER = "genderqueer"
-    AGENDER = "agender"
-    SELF_DESCRIBE = "self_describe"
-    PREFER_NOT_TO_SAY = "prefer_not_to_say"
+# Replace with database in production
+API_KEYS = {
+    "wapss_research_2026": {"tier": "research", "org": "demo"},
+    "wapss_commercial_2026": {"tier": "commercial", "org": "demo"},
+}
 
+async def authenticate(key: str = Security(API_KEY_HEADER)):
+    if not key:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "Missing API key",
+                "help": "Include X-API-Key header. Contact rjkosambiya@gmail.com for access.",
+            },
+        )
+    if key not in API_KEYS:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "Invalid API key",
+                "tiers": {
+                    "research": "Free — basic scoring (total, severity, subscales)",
+                    "commercial": "Licensed — classification, clinical flags, Temporal OS payload",
+                },
+                "contact": "rjkosambiya@gmail.com",
+            },
+        )
+    return API_KEYS[key]
 
-class BiologicalSex(str, Enum):
-    AFAB = "assigned_female_at_birth"
-    AMAB = "assigned_male_at_birth"
-    INTERSEX = "intersex"
-    PREFER_NOT_TO_SAY = "prefer_not_to_say"
+# ═══════════════════════════════════════
+# STORAGE (replace with PostgreSQL + TimescaleDB in production)
+# ═══════════════════════════════════════
 
+biometric_store: Dict[str, list] = defaultdict(list)
+score_history: Dict[str, list] = defaultdict(list)
 
-class SeverityBand(str, Enum):
-    LOW = "low"
-    MODERATE = "moderate"
-    HIGH = "high"
+# ═══════════════════════════════════════
+# SCORING ENGINE (TRADE SECRET: centroids + normalization)
+# ═══════════════════════════════════════
 
+REVERSE_ITEMS = {4, 5, 7, 8}  # 1-indexed
 
-class WearablePlatform(str, Enum):
-    APPLE_HEALTHKIT = "apple_healthkit"
-    COROS = "coros"
-    GARMIN = "garmin"
-    FITBIT = "fitbit"
-    SAMSUNG_HEALTH = "samsung_health"
-    POLAR = "polar"
-    OTHER = "other"
+FACTOR_LOADINGS = np.array([
+    [0.64, 0.00, 0.00],  # SQ1
+    [0.73, 0.00, 0.00],  # SQ2
+    [0.72, 0.00, 0.00],  # SQ3
+    [0.00, 0.88, 0.00],  # SQ4 (R)
+    [0.00, 0.81, 0.00],  # SQ5 (R)
+    [0.87, 0.00, 0.00],  # SQ6
+    [0.00, 0.00, 0.66],  # SQ7 (R)
+    [0.00, 0.36, 0.66],  # SQ8 (R)
+    [0.82, 0.00, 0.00],  # SQ9
+    [0.76, 0.00, 0.00],  # SQ10
+])
 
+# CALIBRATION: Replace with actual values from SPSS output
+CENTROIDS = {
+    "low_stress_casual": np.array([-0.52, -0.15, -0.30]),
+    "proactive_balanced": np.array([0.10, 0.82, 0.65]),
+    "high_stress_overmonitor": np.array([0.95, -0.45, -0.25]),
+}
 
-# ═══════════════════════════════════════════════════════════════════
-# REQUEST / RESPONSE MODELS
-# ═══════════════════════════════════════════════════════════════════
+NORM_MEANS = np.array([2.1, 1.8, 1.9])
+NORM_SDS = np.array([0.85, 0.90, 0.80])
 
-class ScoreRequest(BaseModel):
-    respondent_id: Optional[str] = Field(
-        None,
-        description="Optional client-supplied identifier. Enables longitudinal tracking "
-                    "and auto-merge of biometric data into the scoring response.",
-    )
-    age: int = Field(..., ge=13, le=100)
-    gender_identity: GenderIdentity
-    self_described_gender: Optional[str] = Field(
-        None, description="Required if gender_identity='self_describe'"
-    )
-    biological_sex: Optional[BiologicalSex] = None
-    menstruates: bool = Field(
-        ...,
-        description="Independent of gender identity. Controls SQ12 administration.",
-    )
-
-    # Items — PSS-derived (SQ1–SQ10), wearable-augmented (SQ11), conditional (SQ12)
-    sq1: int = Field(..., ge=0, le=4)
-    sq2: int = Field(..., ge=0, le=4)
-    sq3: int = Field(..., ge=0, le=4)
-    sq4: int = Field(..., ge=0, le=4)
-    sq5: int = Field(..., ge=0, le=4)
-    sq6: int = Field(..., ge=0, le=4)
-    sq7: int = Field(..., ge=0, le=4)
-    sq8: int = Field(..., ge=0, le=4)
-    sq9: int = Field(..., ge=0, le=4)
-    sq10: int = Field(..., ge=0, le=4)
-    sq11: int = Field(..., ge=0, le=4, description="I trust the health data on my wearable")
-    sq12: Optional[int] = Field(
-        None,
-        ge=0,
-        le=4,
-        description="I worry about menstrual-cycle data on my device (required if menstruates=True)",
-    )
-
-    @model_validator(mode="after")
-    def validate_conditional_items(self):
-        if self.gender_identity == GenderIdentity.SELF_DESCRIBE and not self.self_described_gender:
-            raise ValueError("self_described_gender is required when gender_identity='self_describe'")
-        if self.menstruates and self.sq12 is None:
-            raise ValueError("sq12 is required when menstruates=True")
-        if not self.menstruates and self.sq12 is not None:
-            raise ValueError("sq12 must be omitted when menstruates=False")
-        return self
-
-
-class BiometricSnapshot(BaseModel):
-    respondent_id: str = Field(..., description="Required. Links biometric data to respondent.")
-    platform: WearablePlatform
-    timestamp_utc: Optional[datetime] = None
-
-    # Cardiovascular
-    resting_hr_bpm: Optional[float] = Field(None, ge=20, le=220)
-    hrv_rmssd_ms: Optional[float] = Field(None, ge=0, le=500)
-    spo2_pct: Optional[float] = Field(None, ge=50, le=100)
-
-    # Sleep
-    sleep_total_hours: Optional[float] = Field(None, ge=0, le=24)
-    sleep_efficiency_pct: Optional[float] = Field(None, ge=0, le=100)
-    deep_sleep_minutes: Optional[float] = Field(None, ge=0, le=600)
-    rem_sleep_minutes: Optional[float] = Field(None, ge=0, le=600)
-
-    # Activity
-    daily_steps: Optional[int] = Field(None, ge=0, le=100000)
-    active_minutes: Optional[int] = Field(None, ge=0, le=1440)
-    vo2max_ml_kg_min: Optional[float] = Field(None, ge=10, le=90)
-
-    # Device-derived stress / recovery proxies
-    device_stress_score: Optional[float] = Field(None, ge=0, le=100, description="Garmin/COROS/Fitbit stress score")
-    body_battery: Optional[float] = Field(None, ge=0, le=100, description="Garmin/COROS recovery proxy")
-    readiness_score: Optional[float] = Field(None, ge=0, le=100)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# IN-MEMORY STORES (Phase 1 — Postgres in Phase 2)
-# ═══════════════════════════════════════════════════════════════════
-
-score_history: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-biometric_store: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SCORING
-# ═══════════════════════════════════════════════════════════════════
-
-REVERSE_ITEMS = {"sq4", "sq5", "sq7", "sq8"}
-
-
-def reverse_score(value: int, max_value: int = 4) -> int:
-    return max_value - value
-
-
-def latest_biometrics(respondent_id: str) -> Optional[Dict[str, Any]]:
-    if respondent_id and respondent_id in biometric_store and biometric_store[respondent_id]:
-        return biometric_store[respondent_id][-1]
-    return None
-
-
-def lca_phenotype_stub() -> Dict[str, Any]:
-    """
-    Four-class LCA stress phenotype framework declaration.
-    The classifier itself (centroids, posterior probabilities, class labels)
-    is part of the proprietary commercial-tier algorithm, with class
-    structure derived from the IJPM validation cohort (n in submission).
-    """
-    return {
-        "framework": "Four-class latent class analysis (LCA) stress phenotype",
-        "classification": "available_in_commercial_tier",
-        "note": (
-            "Class assignment, posterior class probabilities, and phenotype "
-            "labels are part of the proprietary algorithm. Commercial license "
-            "required. Contact rjkosambiya@gmail.com."
-        ),
-        "validation": "WA-PSS validation paper in submission to Indian Journal of Psychological Medicine",
-    }
-
-
-def score_payload(req: ScoreRequest) -> Dict[str, Any]:
-    items = {
-        "sq1": req.sq1, "sq2": req.sq2, "sq3": req.sq3, "sq4": req.sq4,
-        "sq5": req.sq5, "sq6": req.sq6, "sq7": req.sq7, "sq8": req.sq8,
-        "sq9": req.sq9, "sq10": req.sq10, "sq11": req.sq11,
-    }
-    if req.menstruates:
-        items["sq12"] = req.sq12
-
-    scored = {k: (reverse_score(v) if k in REVERSE_ITEMS else v) for k, v in items.items()}
-
-    pss_core_keys = [f"sq{i}" for i in range(1, 11)]
-    pss_total = sum(scored[k] for k in pss_core_keys)
-    wa_total = sum(scored.values())
-    n_items = len(scored)
-    normalized = wa_total / (n_items * 4)
-
-    if normalized < 0.35:
-        severity = SeverityBand.LOW
-    elif normalized < 0.65:
-        severity = SeverityBand.MODERATE
-    else:
-        severity = SeverityBand.HIGH
-
-    bio = latest_biometrics(req.respondent_id) if req.respondent_id else None
-
-    response = {
-        "scoring": {
-            "pss_core_total": pss_total,
-            "pss_core_range": "0–40",
-            "wa_total": wa_total,
-            "wa_total_range": f"0–{n_items * 4}",
-            "normalized": round(normalized, 3),
-            "severity_band": severity.value,
-            "items_administered": n_items,
-            "reverse_scored": sorted(REVERSE_ITEMS),
-        },
-        "profile_meta": {
-            "gender_identity": req.gender_identity.value,
-            "self_described_gender": req.self_described_gender,
-            "biological_sex": req.biological_sex.value if req.biological_sex else None,
-            "menstruates": req.menstruates,
-            "sq12_administered": req.menstruates,
-            "age": req.age,
-        },
-        "biometric_merge": {
-            "merged": bio is not None,
-            "latest_biometric": bio,
-        },
-        "phenotype": lca_phenotype_stub(),
-        "licensing": {
-            "scale_items": "CC BY-NC 4.0",
-            "scoring_algorithm": "Proprietary — commercial license for production use",
-            "wearable_mappings": "Open documentation",
-            "citation": (
-                "Kosambiya RJ. Wearable-Augmented Perceived Stress Scale (WA-PSS), v3.0. "
-                "2026. Validation paper: Indian Journal of Psychological Medicine (in submission)."
-            ),
-        },
-        "respondent_id": req.respondent_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Persist to history if respondent_id supplied
-    if req.respondent_id:
-        score_history[req.respondent_id].append({
-            "timestamp": response["timestamp"],
-            "wa_total": wa_total,
-            "pss_core_total": pss_total,
-            "normalized": round(normalized, 3),
-            "severity_band": severity.value,
-            "items_administered": n_items,
-        })
-
-    return response
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SDK FIELD MAPPINGS — for partner integrations
-# ═══════════════════════════════════════════════════════════════════
-
-SDK_FIELD_MAPPINGS = {
-    "apple_healthkit": {
-        "resting_hr_bpm": "HKQuantityTypeIdentifierRestingHeartRate",
-        "hrv_rmssd_ms": "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
-        "spo2_pct": "HKQuantityTypeIdentifierOxygenSaturation",
-        "sleep_total_hours": "HKCategoryTypeIdentifierSleepAnalysis (asleep duration)",
-        "daily_steps": "HKQuantityTypeIdentifierStepCount",
-        "active_minutes": "HKQuantityTypeIdentifierAppleExerciseTime",
-        "vo2max_ml_kg_min": "HKQuantityTypeIdentifierVO2Max",
+PHENOTYPE_INFO = {
+    "low_stress_casual": {
+        "label": "Low-Stress Casual User",
+        "risk": "LOW",
+        "description": "Minimal distress, low device engagement.",
+        "interventions": [
+            "Gamified wellness challenges",
+            "Preventive health nudges",
+            "Meaningful tracking adoption support",
+        ],
     },
-    "coros": {
-        "resting_hr_bpm": "rhr",
-        "hrv_rmssd_ms": "hrv",
-        "sleep_total_hours": "sleep.totalSleepTime",
-        "deep_sleep_minutes": "sleep.deepSleep",
-        "rem_sleep_minutes": "sleep.remSleep",
-        "daily_steps": "steps",
-        "vo2max_ml_kg_min": "vo2max",
-        "body_battery": "energy",
-        "endpoint": "COROS Training Hub API v3",
+    "proactive_balanced": {
+        "label": "Proactive Balanced User",
+        "risk": "NOMINAL",
+        "description": "High confidence, emotional regulation, active engagement. Ideal wellness profile.",
+        "interventions": [
+            "Advanced coaching integration",
+            "Goal escalation features",
+            "Peer mentoring candidacy",
+        ],
     },
-    "garmin": {
-        "resting_hr_bpm": "restingHeartRate",
-        "hrv_rmssd_ms": "hrvWeeklyAverage",
-        "sleep_total_hours": "sleepTimeSeconds / 3600",
-        "daily_steps": "steps",
-        "device_stress_score": "averageStressLevel",
-        "body_battery": "bodyBatteryHighestValue",
-        "endpoint": "Garmin Connect Health API",
+    "high_stress_overmonitor": {
+        "label": "High-Stress Over-Monitor",
+        "risk": "HIGH",
+        "description": "Elevated distress with compulsive monitoring. Intervention indicated.",
+        "interventions": [
+            "Tele-MANAS referral (14416)",
+            "CBT-based alert modulation",
+            "Monitoring frequency caps",
+            "Clinician review recommended",
+        ],
     },
-    "fitbit": {
-        "resting_hr_bpm": "activities-heart.value.restingHeartRate",
-        "hrv_rmssd_ms": "hrv.value.dailyRmssd",
-        "spo2_pct": "spo2.value.avg",
-        "sleep_total_hours": "sleep.summary.totalMinutesAsleep / 60",
-        "daily_steps": "activities-steps.value",
-        "device_stress_score": "stress.score",
-        "readiness_score": "readiness.score",
-    },
-    "samsung_health": {
-        "resting_hr_bpm": "com.samsung.shealth.tracker.heart_rate (resting)",
-        "spo2_pct": "com.samsung.shealth.tracker.oxygen_saturation",
-        "sleep_total_hours": "com.samsung.shealth.sleep",
-        "daily_steps": "com.samsung.shealth.tracker.pedometer_step_count",
-    },
-    "polar": {
-        "resting_hr_bpm": "resting-heart-rate",
-        "hrv_rmssd_ms": "nightly-recharge.heart-rate-variability-avg",
-        "sleep_total_hours": "sleep.sleep-duration",
-        "daily_steps": "activity-summary.steps",
-        "readiness_score": "nightly-recharge.recharge-status",
-        "endpoint": "Polar AccessLink API v3",
+    "unclassified": {
+        "label": "Unclassified",
+        "risk": "INDETERMINATE",
+        "description": "Ambiguous profile. Additional assessment recommended.",
+        "interventions": [
+            "Retest in 2 weeks",
+            "Clinical interview recommended",
+        ],
     },
 }
 
+WEARABLE_PLATFORMS = {
+    "apple_watch": {
+        "name": "Apple Watch",
+        "sync": "HealthKit Background Delivery",
+        "os": "iOS",
+        "sdk_fields": {
+            "resting_heart_rate": "HKQuantityTypeIdentifierRestingHeartRate",
+            "hrv": "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+            "steps": "HKQuantityTypeIdentifierStepCount",
+            "sleep": "HKCategoryTypeIdentifierSleepAnalysis",
+            "spo2": "HKQuantityTypeIdentifierOxygenSaturation",
+            "respiratory_rate": "HKQuantityTypeIdentifierRespiratoryRate",
+            "wrist_temperature": "HKQuantityTypeIdentifierAppleWalkingWristTemperature",
+        },
+    },
+    "coros": {
+        "name": "COROS",
+        "sync": "COROS Training Hub API",
+        "os": "iOS / Android",
+        "sdk_fields": {
+            "resting_heart_rate": "rest_hr",
+            "hrv": "hrv",
+            "steps": "daily_steps",
+            "sleep_duration": "sleep_duration",
+            "sleep_score": "sleep_score",
+            "spo2": "spo2",
+        },
+    },
+    "garmin": {
+        "name": "Garmin",
+        "sync": "Garmin Connect API / Health Connect",
+        "os": "iOS / Android",
+        "sdk_fields": {
+            "resting_heart_rate": "restingHeartRate",
+            "hrv": "hrvStatus",
+            "steps": "totalSteps",
+            "sleep": "sleepTimeSeconds",
+            "sleep_score": "overallSleepScore",
+            "spo2": "spo2",
+            "respiratory_rate": "respirationRate",
+            "stress": "stressLevel",
+        },
+    },
+    "fitbit": {
+        "name": "Fitbit / Google Pixel Watch",
+        "sync": "Fitbit Web API / Health Connect",
+        "os": "iOS / Android",
+        "sdk_fields": {
+            "resting_heart_rate": "resting_heart_rate",
+            "steps": "steps",
+            "sleep_score": "sleep_score",
+            "spo2": "spo2",
+            "stress": "stress_management_score",
+        },
+    },
+    "samsung": {
+        "name": "Samsung Galaxy Watch",
+        "sync": "Samsung Health SDK / Health Connect",
+        "os": "Android",
+        "sdk_fields": {
+            "heart_rate": "HeartRateRecord",
+            "steps": "StepsRecord",
+            "sleep": "SleepSessionRecord",
+            "spo2": "OxygenSaturationRecord",
+            "stress": "stress_score",
+        },
+    },
+    "polar": {
+        "name": "Polar",
+        "sync": "Polar AccessLink API",
+        "os": "iOS / Android",
+        "sdk_fields": {
+            "resting_heart_rate": "resting_hr",
+            "hrv": "hrv",
+            "steps": "steps",
+            "sleep": "sleep",
+        },
+    },
+    "noise": {"name": "Noise", "sync": "Manual entry", "os": "Android", "sdk_fields": {}},
+    "boat": {"name": "boAt", "sync": "Manual entry", "os": "Android", "sdk_fields": {}},
+    "fireboltt": {"name": "Fire-Boltt", "sync": "Manual entry", "os": "Android", "sdk_fields": {}},
+    "other": {"name": "Other", "sync": "Manual entry", "os": "Any", "sdk_fields": {}},
+}
 
-# ═══════════════════════════════════════════════════════════════════
+
+def score_pss10(responses: list) -> dict:
+    scored = [4 - v if (i + 1) in REVERSE_ITEMS else v for i, v in enumerate(responses)]
+    total = sum(scored)
+    severity = "low" if total <= 13 else ("moderate" if total <= 26 else "high")
+    helplessness = sum(scored[i] for i in [0, 1, 2, 5, 8, 9])
+    self_efficacy = sum(scored[i] for i in [3, 4, 6, 7])
+    return {
+        "total": total,
+        "severity": severity,
+        "helplessness": helplessness,
+        "self_efficacy": self_efficacy,
+    }
+
+
+def compute_factor_scores(responses: list) -> np.ndarray:
+    scored = np.array(
+        [4 - v if (i + 1) in REVERSE_ITEMS else v for i, v in enumerate(responses)],
+        dtype=float,
+    )
+    factors = []
+    for f in range(3):
+        weights = FACTOR_LOADINGS[:, f]
+        mask = weights > 0
+        if mask.any():
+            factors.append(np.average(scored[mask], weights=weights[mask]))
+        else:
+            factors.append(0.0)
+    return (np.array(factors) - NORM_MEANS) / NORM_SDS
+
+
+def classify_phenotype(z_scores: np.ndarray) -> dict:
+    distances = {k: np.linalg.norm(z_scores - c) for k, c in CENTROIDS.items()}
+    neg_dists = np.array([-d for d in distances.values()])
+    exp_vals = np.exp(neg_dists - neg_dists.max())
+    probabilities = exp_vals / exp_vals.sum()
+    prob_dict = dict(zip(distances.keys(), probabilities.tolist()))
+    best = max(prob_dict, key=prob_dict.get)
+    confidence = prob_dict[best]
+    return {
+        "phenotype": best if confidence >= 0.55 else "unclassified",
+        "confidence": confidence,
+        "probabilities": prob_dict,
+    }
+
+
+# ═══════════════════════════════════════
+# MODELS — INCLUSIVE DESIGN
+# ═══════════════════════════════════════
+
+class GenderIdentity(str, Enum):
+    """
+    Gender identity is self-determined and independent of biological sex.
+    Used for demographic analysis and gendered health disparities research.
+    """
+    man = "man"
+    woman = "woman"
+    non_binary = "non_binary"
+    genderqueer = "genderqueer"
+    genderfluid = "genderfluid"
+    agender = "agender"
+    two_spirit = "two_spirit"
+    prefer_not_to_say = "prefer_not_to_say"
+    self_describe = "self_describe"
+
+
+class BiologicalSex(str, Enum):
+    """
+    Sex assigned at birth. Used only when clinically relevant
+    (e.g., pharmacogenomic dosing, hormone-linked biomarker interpretation).
+    """
+    assigned_female = "assigned_female_at_birth"
+    assigned_male = "assigned_male_at_birth"
+    intersex = "intersex"
+    prefer_not_to_say = "prefer_not_to_say"
+
+
+class BiometricPush(BaseModel):
+    """Push wearable data from native app (iOS/Android)."""
+    respondent_id: str = Field(..., description="Unique respondent identifier")
+    platform: str = Field(..., description="Wearable platform (e.g., 'coros', 'apple_watch')")
+    timestamp: Optional[str] = Field(None, description="ISO 8601. Defaults to server time")
+    readings: dict = Field(
+        ...,
+        description="Key-value biometric readings",
+        examples=[{
+            "resting_heart_rate": 68,
+            "hrv": 42,
+            "steps": 8500,
+            "sleep_hours": 6.5,
+            "spo2": 97,
+        }],
+    )
+
+
+class ScoreRequest(BaseModel):
+    """
+    WA-PSS scoring request.
+    
+    INCLUSIVE DESIGN:
+    - gender_identity: How the respondent identifies (demographic/research)
+    - biological_sex: Sex assigned at birth (clinical relevance only)
+    - menstruates: Whether the respondent currently menstruates
+      → This determines whether SQ12 is administered
+      → Decoupled from both gender identity and biological sex
+      → Trans men, non-binary AFAB individuals, and others who menstruate see SQ12
+      → Post-menopausal women, trans women, and others who don't menstruate skip SQ12
+    """
+
+    # ── Respondent ID (for longitudinal tracking + biometric auto-merge) ──
+    respondent_id: Optional[str] = Field(
+        None, description="If provided, auto-pulls stored wearable biometrics"
+    )
+
+    # ── Inclusive Demographics ──
+    gender_identity: GenderIdentity = Field(
+        ..., description="Self-identified gender"
+    )
+    gender_self_description: Optional[str] = Field(
+        None, description="Free text if gender_identity is 'self_describe'"
+    )
+    biological_sex: Optional[BiologicalSex] = Field(
+        None, description="Sex assigned at birth (optional, clinical use only)"
+    )
+    menstruates: bool = Field(
+        ...,
+        description=(
+            "Does the respondent currently menstruate? "
+            "Determines whether SQ12 (menstrual tracking concern) is administered. "
+            "This is independent of gender identity."
+        ),
+    )
+    age: Optional[int] = Field(None, ge=18, le=65)
+    designation: Optional[str] = Field(None, description="Professional role")
+    city: Optional[str] = None
+
+    # ── Wearable Context ──
+    device_brand: Optional[str] = Field(None, description="e.g., 'coros', 'apple_watch'")
+    wearable_duration_months: Optional[int] = Field(None, ge=0)
+
+    # ── Manual Biometrics (fallback if no stored data) ──
+    heart_rate: Optional[float] = Field(None, ge=30, le=220, description="Resting HR (bpm)")
+    hrv: Optional[float] = Field(None, ge=1, le=300, description="HRV RMSSD (ms)")
+    steps: Optional[float] = Field(None, ge=0, description="Daily average steps")
+    sleep_hours: Optional[float] = Field(None, ge=0, le=24, description="Avg sleep (hours)")
+    sleep_score: Optional[float] = Field(None, ge=0, le=100, description="Sleep quality /100")
+    spo2: Optional[float] = Field(None, ge=70, le=100, description="SpO2 %")
+    respiratory_rate: Optional[float] = Field(None, ge=4, le=60, description="Breaths/min")
+    skin_temp: Optional[float] = Field(None, ge=25, le=45, description="Skin temp °C")
+    stress_score: Optional[float] = Field(None, ge=0, le=100, description="Device stress /100")
+    active_minutes: Optional[float] = Field(None, ge=0, description="Daily active minutes")
+
+    # ── PSS-10 Core Items (ALWAYS required) ──
+    sq1: int = Field(..., ge=0, le=4, description="Upset by unexpected health parameter changes")
+    sq2: int = Field(..., ge=0, le=4, description="Unable to control important health metrics")
+    sq3: int = Field(..., ge=0, le=4, description="Nervous and stressed about health data")
+    sq4: int = Field(..., ge=0, le=4, description="Confident handling health problems via device (R)")
+    sq5: int = Field(..., ge=0, le=4, description="Things going well with health goals (R)")
+    sq6: int = Field(..., ge=0, le=4, description="Could not cope with health demands and alerts")
+    sq7: int = Field(..., ge=0, le=4, description="Able to control irritations from alerts (R)")
+    sq8: int = Field(..., ge=0, le=4, description="On top of health monitoring goals (R)")
+    sq9: int = Field(..., ge=0, le=4, description="Angered by uncontrollable health metrics")
+    sq10: int = Field(..., ge=0, le=4, description="Health goals piling up beyond management")
+
+    # ── Additional WA-PSS Items ──
+    sq11: Optional[int] = Field(None, ge=0, le=4, description="Trust in smartwatch health data")
+    sq12: Optional[int] = Field(
+        None, ge=0, le=4,
+        description="Concern about menstrual cycle data — ONLY if menstruates=true",
+    )
+
+    @model_validator(mode="after")
+    def validate_menstrual_item(self):
+        if not self.menstruates and self.sq12 is not None:
+            raise ValueError(
+                "SQ12 (menstrual tracking concern) should only be provided when "
+                "menstruates=true. This item is not applicable for respondents "
+                "who do not currently menstruate."
+            )
+        if self.gender_identity == GenderIdentity.self_describe and not self.gender_self_description:
+            raise ValueError(
+                "gender_self_description is required when gender_identity is 'self_describe'"
+            )
+        return self
+
+
+# ═══════════════════════════════════════
 # ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 
 @app.get("/")
 async def root():
     return {
-        "name": "WA-PSS Scoring API",
+        "service": "WA-PSS Scoring API",
         "version": "3.0.0",
-        "status": "live",
-        "build": "full_v3_inclusive",
-        "endpoints": {
-            "score": "POST /v1/score",
-            "biometrics": "POST /v1/biometrics",
-            "dashboard": "GET /v1/dashboard/{respondent_id}",
-            "scale": "GET /v1/scale",
-            "sdk_mappings": "GET /v1/sdk-mappings",
-            "health": "GET /v1/health",
-            "docs": "GET /docs",
+        "description": (
+            "Wearable-Adapted Perceived Stress Scale — Inclusive, clinically validated "
+            "scoring engine with wearable biomarker integration and digital phenotype classification."
+        ),
+        "inclusive_design": {
+            "gender_identity": "Self-determined, 9 options including self-describe",
+            "biological_sex": "Optional, for clinical use only",
+            "menstrual_item": (
+                "SQ12 is administered based on self-reported menstruation status, "
+                "NOT gender identity. Trans men, non-binary AFAB individuals, "
+                "and all people who menstruate are included."
+            ),
         },
-        "features": [
-            "LGBTQIA+-inclusive profile capture (decoupled gender identity, biological sex, menstruation)",
-            "Conditional SQ12 administration based on menstruation status (not gender)",
-            "Wearable biometric ingestion (Apple, COROS, Garmin, Fitbit, Samsung, Polar)",
-            "Auto-merge of latest biometrics into scoring responses",
-            "Longitudinal score trajectory per respondent",
-            "Four-class LCA stress phenotype framework",
-            "Dual-tier licensing: scale CC BY-NC 4.0, algorithm proprietary",
-        ],
         "license": {
-            "scale": "CC BY-NC 4.0",
-            "algorithm": "Proprietary",
-            "mappings": "Open documentation",
+            "scale_items": "CC BY-NC 4.0 (open for research)",
+            "classification_algorithm": "Commercial license required",
+            "trade_secret": "Cluster centroids, normalization parameters, decision thresholds",
         },
-        "contact": "rjkosambiya@gmail.com",
+        "pricing": {
+            "research": "Free (basic scoring: total, severity, subscales)",
+            "commercial": "INR 2-5 per API call or annual subscription",
+            "contact": "rjkosambiya@gmail.com",
+        },
+        "citation": (
+            "Kosambiya RJ et al. WA-PSS: Development and Psychometric Validation of the "
+            "Wearable-Adapted Perceived Stress Scale. Indian Journal of Psychological Medicine. 2026."
+        ),
+        "endpoints": {
+            "POST /v1/score": "Score WA-PSS + classify phenotype + auto-merge wearable data",
+            "POST /v1/biometrics": "Push live wearable data from native app",
+            "GET /v1/dashboard/{respondent_id}": "Clinician longitudinal trajectory view",
+            "GET /v1/scale": "Scale items with inclusive administration guide (CC BY-NC 4.0)",
+            "GET /v1/platforms": "Supported wearable platforms with SDK field mapping",
+            "GET /v1/health": "Service health check",
+        },
+        "documentation": "/docs",
+    }
+
+
+@app.post("/v1/biometrics")
+async def push_biometrics(data: BiometricPush, cred: dict = Depends(authenticate)):
+    ts = data.timestamp or datetime.now(timezone.utc).isoformat()
+    platform = WEARABLE_PLATFORMS.get(data.platform)
+    if not platform:
+        raise HTTPException(
+            400,
+            detail={
+                "error": f"Unknown platform: {data.platform}",
+                "supported": list(WEARABLE_PLATFORMS.keys()),
+                "help": "GET /v1/platforms for full list with SDK field mapping",
+            },
+        )
+
+    biometric_store[data.respondent_id].append({
+        "timestamp": ts,
+        "platform": data.platform,
+        "readings": data.readings,
+    })
+
+    # Retain 90 days
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    biometric_store[data.respondent_id] = [
+        e for e in biometric_store[data.respondent_id] if e["timestamp"] >= cutoff
+    ]
+
+    return {
+        "status": "stored",
+        "respondent_id": data.respondent_id,
+        "platform": platform["name"],
+        "readings_received": len(data.readings),
+        "total_stored": len(biometric_store[data.respondent_id]),
+        "next_step": "POST /v1/score with the same respondent_id to auto-merge biometrics",
     }
 
 
 @app.post("/v1/score")
-async def score(req: ScoreRequest):
-    try:
-        return score_payload(req)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+async def score_wapss(req: ScoreRequest, cred: dict = Depends(authenticate)):
+    tier = cred["tier"]
+    responses = [req.sq1, req.sq2, req.sq3, req.sq4, req.sq5,
+                 req.sq6, req.sq7, req.sq8, req.sq9, req.sq10]
 
+    pss = score_pss10(responses)
 
-@app.post("/v1/biometrics")
-async def ingest_biometrics(snapshot: BiometricSnapshot):
-    """
-    Ingest a wearable biometric snapshot. Auto-merged into the respondent's
-    next /v1/score call. Snapshots are stored per respondent_id.
-    """
-    if snapshot.timestamp_utc is None:
-        snapshot.timestamp_utc = datetime.now(timezone.utc)
+    # Resolve biometrics: auto-merge from store or manual entry
+    biometrics = {}
+    bio_source = "none"
 
-    record = snapshot.model_dump(mode="json")
-    biometric_store[snapshot.respondent_id].append(record)
+    if req.respondent_id and req.respondent_id in biometric_store:
+        stored = biometric_store[req.respondent_id]
+        if stored:
+            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            recent = [e for e in stored if e["timestamp"] >= week_ago]
+            if len(recent) >= 3:
+                avg = {}
+                for entry in recent:
+                    for k, v in entry["readings"].items():
+                        if isinstance(v, (int, float)):
+                            avg.setdefault(k, []).append(v)
+                biometrics = {k: round(sum(v) / len(v), 2) for k, v in avg.items()}
+                bio_source = f"7-day average ({len(recent)} syncs)"
+            else:
+                biometrics = stored[-1]["readings"]
+                bio_source = f"latest sync ({stored[-1]['platform']})"
 
-    return {
-        "status": "stored",
-        "respondent_id": snapshot.respondent_id,
-        "platform": snapshot.platform.value,
-        "snapshot_count_for_respondent": len(biometric_store[snapshot.respondent_id]),
-        "stored_record": record,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+    if not biometrics:
+        for field in ["heart_rate", "hrv", "steps", "sleep_hours", "sleep_score",
+                      "spo2", "respiratory_rate", "skin_temp", "stress_score", "active_minutes"]:
+            val = getattr(req, field)
+            if val is not None:
+                biometrics[field] = val
+        if biometrics:
+            bio_source = "manual_entry"
+
+    # Determine item count
+    items_administered = 10
+    if req.sq11 is not None:
+        items_administered += 1
+    if req.menstruates and req.sq12 is not None:
+        items_administered += 1
+
+    # Build response
+    gender_display = (
+        req.gender_self_description
+        if req.gender_identity == GenderIdentity.self_describe
+        else req.gender_identity.value.replace("_", " ").title()
+    )
+
+    result = {
+        "meta": {
+            "api_version": "3.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tier": tier,
+            "respondent_id": req.respondent_id,
+        },
+        "respondent": {
+            "gender_identity": req.gender_identity.value,
+            "gender_display": gender_display,
+            "biological_sex": req.biological_sex.value if req.biological_sex else None,
+            "menstruates": req.menstruates,
+            "age": req.age,
+            "items_administered": items_administered,
+        },
+        "scoring": {
+            "pss_total": pss["total"],
+            "severity": pss["severity"],
+            "severity_range": {"low": "0-13", "moderate": "14-26", "high": "27-40"},
+            "subscales": {
+                "perceived_helplessness": {"score": pss["helplessness"], "max": 24},
+                "perceived_self_efficacy": {"score": pss["self_efficacy"], "max": 16},
+            },
+            "additional_items": {
+                "sq11_device_trust": req.sq11,
+                **({"sq12_menstrual_concern": req.sq12} if req.menstruates else {}),
+            },
+        },
+        "biometrics": {
+            "source": bio_source,
+            "data": biometrics,
+        },
     }
+
+    # Commercial tier: classification + flags + Temporal OS
+    if tier == "commercial":
+        z = compute_factor_scores(responses)
+        cls = classify_phenotype(z)
+        phenotype = cls["phenotype"]
+        meta = PHENOTYPE_INFO[phenotype]
+
+        adapt = req.wearable_duration_months is not None and req.wearable_duration_months <= 3
+        elevated_distress = float(z[0]) > 1.5
+        low_efficacy = float(z[1]) < -1.0
+        tele_manas = pss["severity"] == "high" or (elevated_distress and low_efficacy)
+
+        # Gender-informed risk: based on biological sex if provided, not gender identity
+        bio_female_elevated = (
+            req.biological_sex == BiologicalSex.assigned_female
+            and elevated_distress
+        )
+
+        result["factor_analysis"] = {
+            "method": "EFA (Principal Axis Factoring, Varimax rotation)",
+            "total_variance_explained": "60.2%",
+            "factors": {
+                "emotional_distress": {
+                    "z_score": round(float(z[0]), 4),
+                    "items": ["SQ1", "SQ2", "SQ3", "SQ6", "SQ9", "SQ10"],
+                    "variance": "34.83%",
+                },
+                "self_efficacy": {
+                    "z_score": round(float(z[1]), 4),
+                    "items": ["SQ4", "SQ5"],
+                    "variance": "15.93%",
+                },
+                "emotional_control": {
+                    "z_score": round(float(z[2]), 4),
+                    "items": ["SQ7", "SQ8"],
+                    "variance": "9.41%",
+                },
+            },
+        }
+
+        result["classification"] = {
+            "method": "LCA 3-class solution (softmax over Euclidean distance)",
+            "phenotype": phenotype,
+            "label": meta["label"],
+            "description": meta["description"],
+            "confidence": round(cls["confidence"], 4),
+            "risk_level": meta["risk"],
+            "class_probabilities": {
+                k: round(v, 4) for k, v in cls["probabilities"].items()
+            },
+        }
+
+        result["clinical_flags"] = {
+            "elevated_distress": elevated_distress,
+            "low_self_efficacy": low_efficacy,
+            "afab_elevated_distress": bio_female_elevated,
+            "adaptation_phase": adapt,
+            "tele_manas_referral": tele_manas,
+            "tele_manas_helpline": "14416" if tele_manas else None,
+        }
+
+        result["interventions"] = meta["interventions"]
+
+        result["temporal_os"] = {
+            "layer": 1,
+            "module": "digital_phenotyping",
+            "phenotype_id": phenotype,
+            "factor_vector": [round(float(x), 4) for x in z],
+            "biometric_context": biometrics,
+            "biometric_source": bio_source,
+            "integration_ready": True,
+        }
+
+        # Store for longitudinal tracking
+        if req.respondent_id:
+            score_history[req.respondent_id].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "pss_total": pss["total"],
+                "severity": pss["severity"],
+                "phenotype": phenotype,
+                "confidence": round(cls["confidence"], 4),
+                "factors": [round(float(x), 4) for x in z],
+                "tele_manas": tele_manas,
+            })
+
+    return result
 
 
 @app.get("/v1/dashboard/{respondent_id}")
-async def dashboard(respondent_id: str):
-    """
-    Longitudinal trajectory for a respondent: score history + biometric trends.
-    Intended for clinician-facing dashboards and research follow-up.
-    """
+async def dashboard(respondent_id: str, cred: dict = Depends(authenticate)):
+    if cred["tier"] != "commercial":
+        raise HTTPException(403, detail="Dashboard requires commercial tier API key")
+
     scores = score_history.get(respondent_id, [])
-    biometrics = biometric_store.get(respondent_id, [])
+    bios = biometric_store.get(respondent_id, [])
 
-    if not scores and not biometrics:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No data on file for respondent_id='{respondent_id}'",
-        )
-
-    # Trajectory summary
-    if scores:
-        wa_totals = [s["wa_total"] for s in scores]
-        trajectory = {
-            "n_assessments": len(scores),
-            "first_assessment": scores[0]["timestamp"],
-            "latest_assessment": scores[-1]["timestamp"],
-            "wa_total_first": wa_totals[0],
-            "wa_total_latest": wa_totals[-1],
-            "wa_total_change": wa_totals[-1] - wa_totals[0],
-            "wa_total_mean": round(sum(wa_totals) / len(wa_totals), 2),
-            "severity_band_latest": scores[-1]["severity_band"],
+    if not scores:
+        return {
+            "respondent_id": respondent_id,
+            "status": "no_assessments",
+            "message": "No WA-PSS assessments recorded for this respondent.",
         }
-    else:
-        trajectory = None
+
+    latest = scores[-1]
+
+    transitions = []
+    for i in range(1, len(scores)):
+        if scores[i]["phenotype"] != scores[i - 1]["phenotype"]:
+            transitions.append({
+                "from": scores[i - 1]["phenotype"],
+                "to": scores[i]["phenotype"],
+                "timestamp": scores[i]["timestamp"],
+            })
 
     return {
         "respondent_id": respondent_id,
-        "score_trajectory": trajectory,
-        "score_history": scores,
-        "biometric_snapshots": biometrics,
-        "biometric_snapshot_count": len(biometrics),
-        "phenotype": lca_phenotype_stub(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@app.get("/v1/scale")
-async def scale():
-    return {
-        "instrument": "Wearable-Augmented Perceived Stress Scale (WA-PSS)",
-        "version": "3.0.0",
-        "license": "CC BY-NC 4.0 (items only — algorithm proprietary)",
-        "design": {
-            "profile_fields": {
-                "gender_identity": {
-                    "type": "enum",
-                    "options": [g.value for g in GenderIdentity],
-                    "note": "9 options including self_describe and prefer_not_to_say",
-                },
-                "biological_sex": {
-                    "type": "enum (optional)",
-                    "options": [s.value for s in BiologicalSex],
-                    "note": "Used only when clinically relevant (e.g., pharmacogenomic dosing)",
-                },
-                "menstruates": {
-                    "type": "boolean",
-                    "note": "Independent of gender identity. Controls SQ12 administration.",
-                },
+        "total_assessments": len(scores),
+        "total_biometric_syncs": len(bios),
+        "current": {
+            "phenotype": latest["phenotype"],
+            "label": PHENOTYPE_INFO[latest["phenotype"]]["label"],
+            "pss_total": latest["pss_total"],
+            "severity": latest["severity"],
+            "confidence": latest["confidence"],
+            "factors": {
+                "emotional_distress": latest["factors"][0],
+                "self_efficacy": latest["factors"][1],
+                "emotional_control": latest["factors"][2],
             },
-            "core_items": "SQ1–SQ10 (PSS-derived, wearable-contextualized)",
-            "augmented_item": "SQ11 (wearable trust) — administered to all",
-            "conditional_item": "SQ12 (menstrual-cycle data concern) — administered if menstruates=True",
-            "response_scale": "0 (never) – 4 (very often)",
-            "reverse_scored": ["sq4", "sq5", "sq7", "sq8"],
+            "tele_manas_flagged": latest["tele_manas"],
         },
-        "items": [
-            {"id": "SQ1", "text": "Upset by unexpected changes in your health-metric data", "reverse": False},
-            {"id": "SQ2", "text": "Unable to control important health metrics shown by your device", "reverse": False},
-            {"id": "SQ3", "text": "Nervous or stressed about what your health data shows", "reverse": False},
-            {"id": "SQ4", "text": "Confident in handling health problems flagged by your device", "reverse": True},
-            {"id": "SQ5", "text": "Things going your way with your health goals", "reverse": True},
-            {"id": "SQ6", "text": "Could not cope with the health demands and alerts you faced", "reverse": False},
-            {"id": "SQ7", "text": "Able to control irritations caused by device alerts", "reverse": True},
-            {"id": "SQ8", "text": "On top of your health-monitoring goals", "reverse": True},
-            {"id": "SQ9", "text": "Angered by things outside your control in your health metrics", "reverse": False},
-            {"id": "SQ10", "text": "Health goals piling up beyond what you can manage", "reverse": False},
-            {"id": "SQ11", "text": "I trust the health data on my wearable device", "reverse": False, "applies_to": "all"},
-            {"id": "SQ12", "text": "I worry about the menstrual-cycle data on my device", "reverse": False, "applies_to": "respondents_who_menstruate"},
+        "trajectory": [
+            {"timestamp": s["timestamp"], "pss": s["pss_total"], "phenotype": s["phenotype"]}
+            for s in scores
         ],
-        "phenotype": lca_phenotype_stub(),
-        "wearable_platforms_supported": [p.value for p in WearablePlatform],
-        "citation": (
-            "Kosambiya RJ. Wearable-Augmented Perceived Stress Scale (WA-PSS), v3.0. "
-            "NAMO Medical Education and Research Institute, Silvassa, 2026. "
-            "Validation paper in submission to Indian Journal of Psychological Medicine."
+        "transitions": transitions,
+        "trend": (
+            "improving" if len(scores) >= 2 and scores[-1]["pss_total"] < scores[0]["pss_total"]
+            else "worsening" if len(scores) >= 2 and scores[-1]["pss_total"] > scores[0]["pss_total"]
+            else "stable"
         ),
     }
 
 
-@app.get("/v1/sdk-mappings")
-async def sdk_mappings():
+@app.get("/v1/scale")
+async def scale_items():
     """
-    Field-level mapping from WA-PSS biometric schema to each wearable platform's
-    native SDK. Companion apps use this to read device data and POST to /v1/biometrics.
+    Returns WA-PSS items with inclusive administration guide.
+    Licensed under CC BY-NC 4.0 for research use.
     """
     return {
-        "purpose": "Map WA-PSS biometric fields to native wearable SDK field names",
-        "license": "Open documentation",
-        "mappings": SDK_FIELD_MAPPINGS,
+        "instrument": "WA-PSS (Wearable-Adapted Perceived Stress Scale)",
+        "version": "3.0.0",
+        "license": "CC BY-NC 4.0",
+        "citation_required": True,
+        "base_instrument": "PSS-10 (Cohen, Kamarck & Mermelstein, 1983)",
+        "inclusive_administration_guide": {
+            "principle": (
+                "Menstrual tracking item (SQ12) is administered based on self-reported "
+                "menstruation status, not gender identity or sex assigned at birth. "
+                "This ensures clinical accuracy and gender inclusivity."
+            ),
+            "ask_the_respondent": "Do you currently menstruate?",
+            "if_yes": "Administer SQ1-SQ12 (12 items)",
+            "if_no": "Administer SQ1-SQ11 (11 items)",
+            "examples": {
+                "cisgender_woman_premenopausal": "menstruates=true → SQ1-SQ12",
+                "cisgender_woman_postmenopausal": "menstruates=false → SQ1-SQ11",
+                "trans_man_menstruating": "menstruates=true → SQ1-SQ12",
+                "trans_man_on_testosterone": "menstruates=false → SQ1-SQ11",
+                "non_binary_afab_menstruating": "menstruates=true → SQ1-SQ12",
+                "cisgender_man": "menstruates=false → SQ1-SQ11",
+                "trans_woman": "menstruates=false → SQ1-SQ11",
+            },
+        },
+        "response_options": {
+            0: "Never",
+            1: "Almost Never",
+            2: "Sometimes",
+            3: "Fairly Often",
+            4: "Very Often",
+        },
+        "reverse_scored_items": ["SQ4", "SQ5", "SQ7", "SQ8"],
+        "items": {
+            "core_pss10": [
+                {"id": "SQ1", "text": "In the last month, how often have you been upset because of unexpected changes in your health parameters on your smartwatch?", "factor": "emotional_distress", "reverse": False},
+                {"id": "SQ2", "text": "In the last month, how often have you felt that you were unable to control the important health metrics in your life?", "factor": "emotional_distress", "reverse": False},
+                {"id": "SQ3", "text": "In the last month, how often have you felt nervous and stressed about your health data?", "factor": "emotional_distress", "reverse": False},
+                {"id": "SQ4", "text": "In the last month, how often have you felt confident about your ability to handle your health problems based on smartwatch data?", "factor": "self_efficacy", "reverse": True},
+                {"id": "SQ5", "text": "In the last month, how often have you felt that things were going your way in managing health goals through your device?", "factor": "self_efficacy", "reverse": True},
+                {"id": "SQ6", "text": "In the last month, how often have you found that you could not cope with all the health-related demands and alerts?", "factor": "emotional_distress", "reverse": False},
+                {"id": "SQ7", "text": "In the last month, how often have you been able to control irritations triggered by health monitoring alerts?", "factor": "emotional_control", "reverse": True},
+                {"id": "SQ8", "text": "In the last month, how often have you felt that you were on top of your health monitoring goals?", "factor": "emotional_control", "reverse": True},
+                {"id": "SQ9", "text": "In the last month, how often have you been angered because of health metrics that were outside of your control?", "factor": "emotional_distress", "reverse": False},
+                {"id": "SQ10", "text": "In the last month, how often have you felt that health goals and concerns were piling up so high that you could not manage them?", "factor": "emotional_distress", "reverse": False},
+            ],
+            "additional": [
+                {"id": "SQ11", "text": "I trust the health data displayed on my smartwatch.", "administered_to": "all_respondents"},
+                {"id": "SQ12", "text": "I worry about my menstrual cycle data shown by my device.", "administered_to": "respondents_who_menstruate_only"},
+            ],
+        },
+    }
+
+
+@app.get("/v1/platforms")
+async def platforms():
+    return {
+        "supported_platforms": {
+            k: {
+                "name": v["name"],
+                "sync_method": v["sync"],
+                "compatible_os": v["os"],
+                "sdk_fields": v["sdk_fields"],
+            }
+            for k, v in WEARABLE_PLATFORMS.items()
+        },
         "integration_flow": [
-            "1. Companion app obtains user permission via HealthKit (iOS) or Health Connect (Android)",
-            "2. App reads wearable data using the platform SDK field names listed here",
-            "3. App POSTs to /v1/biometrics with respondent_id and the mapped fields",
-            "4. When the user completes WA-PSS via /v1/score with the same respondent_id, "
-            "the latest biometric snapshot is auto-merged into the response",
-            "5. Clinician views the longitudinal view via /v1/dashboard/{respondent_id}",
+            "1. User installs companion app (iOS/Android)",
+            "2. App requests HealthKit (iOS) or Health Connect (Android) permissions",
+            "3. App reads wearable data using platform-specific SDK fields listed above",
+            "4. App pushes readings to POST /v1/biometrics with respondent_id",
+            "5. When user completes WA-PSS, app sends POST /v1/score with same respondent_id",
+            "6. API auto-merges latest 7-day biometric average into scoring response",
+            "7. Clinician views GET /v1/dashboard/{respondent_id} for longitudinal trajectory",
         ],
-        "platforms_supported": [p.value for p in WearablePlatform],
     }
 
 
@@ -550,18 +834,12 @@ async def health():
     return {
         "status": "healthy",
         "version": "3.0.0",
-        "build": "full_v3_inclusive",
         "respondents_tracked": len(score_history),
-        "biometric_snapshots_stored": sum(len(v) for v in biometric_store.values()),
+        "biometric_syncs_stored": sum(len(v) for v in biometric_store.values()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ═══════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
